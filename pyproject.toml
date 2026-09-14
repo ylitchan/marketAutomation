@@ -1,0 +1,21 @@
+[project]
+name = "market-automation"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp>=3.13.2",
+    "apscheduler>=3.11.1",
+    "binance-sdk-derivatives-trading-portfolio-margin>=5.2.0",
+    "binance-sdk-derivatives-trading-usds-futures>=9.0.0",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "perk-pushplus-sdk>=1.0.1",
+    "pydantic>=2.12.4",
+    "python-dotenv>=1.2.2",
+    "requests>=2.32.5",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.11",
+]

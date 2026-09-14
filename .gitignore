@@ -1,0 +1,23 @@
+.env
+.venv/
+.orca/
+__pycache__/
+*.py[cod]
+*.bak
+build/
+dist/
+*.egg-info/
+
+# Local credentials and mutable runtime state
+PRIVATE_*
+bn.json
+alert_all*.json
+*.orders.jsonl
+close_records.xlsx
+binance_requests.log*
+.backtest_cache/
+
+# Local IDE and tool state
+.idea/
+.ruff_cache/
+.claude/settings.local.json
