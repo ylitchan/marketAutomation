@@ -840,36 +840,16 @@ class Notifications:
     def __init__(self, http, logger):
         self.http, self.logger = http, logger
 
-    async def send(self, message, *, channel=None):
+    async def send(self, message, *, channel="pushplus"):
         self.logger.info(
             f"发送消息: {message.content if isinstance(message, TradeNotification) else message}"
         )
         try:
-            if channel == "pushplus":
-                if not isinstance(message, TradeNotification):
-                    raise TypeError("PushPlus需要TradeNotification")
-                await asyncio.wait_for(send_pushplus(message), self.http.timeout)
-            elif channel in ("feishu", "wecom"):
-                if not isinstance(message, str):
-                    raise TypeError("市场信号需要文本")
-                if channel == "feishu":
-                    url = os.getenv("FEISHU_WEBHOOK_URL", "")
-                    payload = {"msg_type": "text", "content": {"text": message}}
-                else:
-                    key = os.getenv("AUTOA_WECOM_KEY", "")
-                    url = (
-                        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + key
-                        if key
-                        else ""
-                    )
-                    payload = {"msgtype": "text", "text": {"content": message}}
-                if not url:
-                    self.logger.warning(f"未配置 {channel} webhook")
-                    return
-                session = await self.http.get()
-                async with session.post(url=url, json=payload) as response:
-                    if response.status != 200:
-                        self.logger.error(f"{channel}发送失败: {response.status}")
+            sent = await asyncio.wait_for(
+                send_pushplus(message, channel=channel), self.http.timeout
+            )
+            if not sent:
+                self.logger.warning("未配置 PUSHPLUS_TOKEN")
         except Exception:
             self.logger.exception(f"{channel}消息发送失败")
 

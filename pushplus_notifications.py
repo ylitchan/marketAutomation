@@ -2,17 +2,28 @@ import asyncio
 import datetime
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Sequence
+from typing import Literal, Optional
 
-from perk_pushplus import PushPlusClient, SendRequest, Template
+from perk_pushplus import Channel, PushPlusClient, SendRequest, Template
+
+PushPlusDestination = Literal["pushplus", "feishu", "wecom"]
+
+_WEBHOOK_OPTIONS = {
+    "feishu": ("PUSHPLUS_FEISHU_OPTION", "feishu"),
+    "wecom": ("PUSHPLUS_WECOM_OPTION", "wecom"),
+}
 
 
 @dataclass(frozen=True)
 class TradeNotification:
     title: str
     content: str
+
+
+PushPlusMessage = TradeNotification | str
 
 
 @dataclass(frozen=True)
@@ -223,25 +234,56 @@ def _get_pushplus_client(token: str, secret_key: str) -> PushPlusClient:
     return builder.build()
 
 
+def _resolve_pushplus_destination(
+    destination: PushPlusDestination,
+) -> tuple[Channel, str | None]:
+    if destination == "pushplus":
+        return Channel.WECHAT, None
+    try:
+        env_name, default_option = _WEBHOOK_OPTIONS[destination]
+    except KeyError as exc:
+        raise ValueError(f"未知 PushPlus 发送目标: {destination}") from exc
+    return Channel.WEBHOOK, os.getenv(env_name, "").strip() or default_option
+
+
+def _build_pushplus_request(
+    message: PushPlusMessage,
+    destination: PushPlusDestination,
+) -> SendRequest:
+    channel, option = _resolve_pushplus_destination(destination)
+    builder = SendRequest.builder().channel(channel)
+    if option:
+        builder = builder.option(option)
+    if isinstance(message, TradeNotification):
+        builder = (
+            builder.title(message.title)
+            .content(message.content)
+            .template(Template.MARKDOWN)
+        )
+    elif isinstance(message, str):
+        builder = builder.content(message).template(Template.TXT)
+    else:
+        raise TypeError("PushPlus 消息必须是 TradeNotification 或文本")
+    return builder.build()
+
+
 def _send_pushplus_sync(
-    notification: TradeNotification,
+    message: PushPlusMessage,
     token: str,
     secret_key: str,
+    destination: PushPlusDestination,
 ) -> None:
-    request = (
-        SendRequest.builder()
-        .title(notification.title)
-        .content(notification.content)
-        .template(Template.MARKDOWN)
-        .build()
+    _get_pushplus_client(token, secret_key).send(
+        _build_pushplus_request(message, destination)
     )
-    _get_pushplus_client(token, secret_key).send(request)
 
 
 async def send_pushplus(
-    notification: TradeNotification,
+    message: PushPlusMessage,
     token: Optional[str] = None,
     secret_key: Optional[str] = None,
+    *,
+    channel: PushPlusDestination = "pushplus",
 ) -> bool:
     target_token = token or os.getenv("PUSHPLUS_TOKEN")
     if not target_token:
@@ -252,8 +294,9 @@ async def send_pushplus(
         target_secret_key = os.getenv("PUSHPLUS_SECRET_KEY", "")
     await asyncio.to_thread(
         _send_pushplus_sync,
-        notification,
+        message,
         target_token,
         target_secret_key,
+        channel,
     )
     return True
