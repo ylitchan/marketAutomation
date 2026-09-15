@@ -35,7 +35,7 @@ class PushPlusRequestTests(unittest.TestCase):
         self.assertEqual(request.channel, Channel.WEBHOOK)
         self.assertEqual(request.option, "feishu")
         self.assertEqual(request.template, Template.TXT)
-        self.assertIsNone(request.title)
+        self.assertEqual(request.title, "交易信号")
         self.assertEqual(request.content, "AUTOBN signal")
 
     @patch("pushplus_notifications._get_pushplus_client")
@@ -47,6 +47,8 @@ class PushPlusRequestTests(unittest.TestCase):
         self.assertEqual(request.channel, Channel.WEBHOOK)
         self.assertEqual(request.option, "wecom-production")
         self.assertEqual(request.template, Template.TXT)
+        self.assertEqual(request.title, "交易信号")
+        self.assertEqual(request.content, "AUTOA signal")
 
     def test_unknown_destination_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "未知 PushPlus 发送目标"):

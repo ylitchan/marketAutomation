@@ -262,6 +262,8 @@ def _build_pushplus_request(
         )
     elif isinstance(message, str):
         builder = builder.content(message).template(Template.TXT)
+        if channel == Channel.WEBHOOK:
+            builder = builder.title("交易信号")
     else:
         raise TypeError("PushPlus 消息必须是 TradeNotification 或文本")
     return builder.build()
