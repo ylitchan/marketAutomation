@@ -3444,37 +3444,16 @@ class AUTOBN(MarketStrategy):
 
     async def after_instrument(self, symbol, bars, state, prior, context):
         obs = state.observations.get(symbol)
-        patch = None
-        changed = False
-        window = None
-        if (
+        refresh_existing_bd = (
             symbol not in prior.positions
             and symbol not in state.positions
-            and obs
+            and obs is not None
             and StrategyTag.BD in obs.strategy
-        ):
-            if bars.volumes[-1] >= max(bars.volumes[:-1]):
-                patch = None
-                changed = True
-            elif self._bd_market_matches(bars.closes, bars.volumes, refresh=True):
-                window, _ = await self.data.bd_oi_windows(symbol, context.now)
-                window = [] if window is None else window
-                if await self._is_bd_observation(
-                    symbol,
-                    bars.closes,
-                    bars.volumes,
-                    context.now,
-                    oi_window=window,
-                    refresh=True,
-                ):
-                    patch = obs.model_copy(
-                        update={
-                            "price": bars.price,
-                            "timestamp": context.now.timestamp(),
-                        }
-                    )
-                    changed = True
-        new = None
+        )
+        delete_existing_bd = refresh_existing_bd and bars.volumes[-1] >= max(
+            bars.volumes[:-1]
+        )
+
         if bars.closes[-2] < bars.price and bars.volumes[-1] >= max(
             bars.volumes[-self.VOLUME_LOOKBACK_PERIOD :]
         ):
@@ -3485,9 +3464,23 @@ class AUTOBN(MarketStrategy):
                 strategy=(StrategyTag.BZ,),
                 name=symbol,
             )
-        elif await self._is_bd_observation(
-            symbol, bars.closes, bars.volumes, context.now, oi_window=window
-        ):
+            if obs and not delete_existing_bd:
+                new = new.model_copy(
+                    update={"earliest_open_timestamp": obs.earliest_open_timestamp}
+                )
+            return StatePatch(observations=((symbol, new),))
+
+        if delete_existing_bd:
+            return StatePatch(observations=((symbol, None),))
+
+        initial_bd, refresh_bd = await self._evaluate_bd_observation(
+            symbol,
+            bars.closes,
+            bars.volumes,
+            context.now,
+            refresh_needed=bool(refresh_existing_bd),
+        )
+        if initial_bd:
             new = Observation(
                 price=bars.price,
                 timestamp=context.now.timestamp(),
@@ -3495,14 +3488,22 @@ class AUTOBN(MarketStrategy):
                 strategy=(StrategyTag.BD,),
                 name=symbol,
             )
-        if new:
-            previous = patch if changed else obs
-            if previous:
+            if obs:
                 new = new.model_copy(
-                    update={"earliest_open_timestamp": previous.earliest_open_timestamp}
+                    update={"earliest_open_timestamp": obs.earliest_open_timestamp}
                 )
             return StatePatch(observations=((symbol, new),))
-        return StatePatch(observations=((symbol, patch),)) if changed else StatePatch()
+
+        if refresh_existing_bd and refresh_bd:
+            refreshed = obs.model_copy(
+                update={
+                    "price": bars.price,
+                    "timestamp": context.now.timestamp(),
+                }
+            )
+            return StatePatch(observations=((symbol, refreshed),))
+
+        return StatePatch()
 
     def observation_after_open(self, intent):
         return intent.observation.model_copy(
@@ -3796,55 +3797,53 @@ class AUTOBN(MarketStrategy):
             )
             return Decision()
 
-    def _bd_market_matches(self, kline_close, kline_volume, *, refresh=False):
-        """先用已有价格和成交量淘汰，不为不合格标的请求OI。"""
+    async def _evaluate_bd_observation(
+        self,
+        symbol,
+        kline_close,
+        kline_volume,
+        dtn,
+        *,
+        refresh_needed=False,
+    ):
+        """返回（首次入池，刷新已有BD）；行情和OI各只评估一次。"""
         if kline_close[-1] < max(kline_close[:-1]):
-            return False
+            self.data.gateway.diagnostics.note("prefilter", "bd", "", "rejected")
+            return False, False
+
         volume_peak = max(kline_volume)
         if max(kline_volume[-self.BD_VOLUME_RECENT_COUNT :]) >= volume_peak:
-            return False
-        return (
-            refresh
-            or max(
+            self.data.gateway.diagnostics.note("prefilter", "bd", "", "rejected")
+            return False, False
+
+        initial_market_match = (
+            max(
                 kline_volume[
                     -self.BD_VOLUME_LOOKBACK_COUNT : -self.BD_VOLUME_RECENT_COUNT
                 ]
             )
             == volume_peak
         )
-
-    async def _is_bd_observation(
-        self,
-        symbol,
-        kline_close,
-        kline_volume,
-        dtn,
-        oi_window=None,
-        refresh=False,
-    ):
-        """判断BD观察是否满足首次入池或刷新条件。"""
-        if not self._bd_market_matches(kline_close, kline_volume, refresh=refresh):
+        if not (initial_market_match or refresh_needed):
             self.data.gateway.diagnostics.note("prefilter", "bd", "", "rejected")
-            return False
+            return False, False
         self.data.gateway.diagnostics.note("prefilter", "bd", "", "passed")
 
-        if oi_window is None:
-            oi_window, _ = await self.data.bd_oi_windows(symbol, dtn)
+        oi_window, _ = await self.data.bd_oi_windows(symbol, dtn)
         if oi_window is None or len(oi_window) < self.OI_QUERY_LIMIT:
-            return False
+            return False, False
 
         oi_baseline = oi_window[: -self.BD_OI_LOOKBACK_COUNT]
         oi_old = oi_window[-self.BD_OI_LOOKBACK_COUNT : -self.BD_OI_RECENT_COUNT]
         oi_old_peak = max(oi_old)
         if oi_window[-1] <= oi_old_peak:
-            return False
-        if refresh:
-            return True
+            return False, False
 
-        return (
+        initial = initial_market_match and (
             sample_probability(oi_baseline, oi_old_peak)["chebyshev_upper_bound"]
             < self.SHORT_OI_CHEB_THRESHOLD
         )
+        return initial, True
 
     def calc_stop_profit_loss(self, price, is_long=True, atr=0):
         if atr <= 0:
