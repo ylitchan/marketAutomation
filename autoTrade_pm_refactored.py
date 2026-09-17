@@ -3442,6 +3442,14 @@ class AUTOBN(MarketStrategy):
             StatePatch(positions=((symbol, held.model_copy(update=updates)),))
         )
 
+    @staticmethod
+    def _inherit_same_side_cooldown(new, previous):
+        if previous is None or previous.side != new.side:
+            return new
+        return new.model_copy(
+            update={"earliest_open_timestamp": previous.earliest_open_timestamp}
+        )
+
     async def after_instrument(self, symbol, bars, state, prior, context):
         obs = state.observations.get(symbol)
         refresh_existing_bd = (
@@ -3464,10 +3472,9 @@ class AUTOBN(MarketStrategy):
                 strategy=(StrategyTag.BZ,),
                 name=symbol,
             )
-            if obs and not delete_existing_bd:
-                new = new.model_copy(
-                    update={"earliest_open_timestamp": obs.earliest_open_timestamp}
-                )
+            new = self._inherit_same_side_cooldown(
+                new, None if delete_existing_bd else obs
+            )
             return StatePatch(observations=((symbol, new),))
 
         if delete_existing_bd:
@@ -3488,10 +3495,7 @@ class AUTOBN(MarketStrategy):
                 strategy=(StrategyTag.BD,),
                 name=symbol,
             )
-            if obs:
-                new = new.model_copy(
-                    update={"earliest_open_timestamp": obs.earliest_open_timestamp}
-                )
+            new = self._inherit_same_side_cooldown(new, obs)
             return StatePatch(observations=((symbol, new),))
 
         if refresh_existing_bd and refresh_bd:
