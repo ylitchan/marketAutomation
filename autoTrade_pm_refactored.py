@@ -3177,7 +3177,8 @@ class AUTOBN(MarketStrategy):
         obs = state.observations.get(symbol)
         if symbol not in state.positions and obs:
             if obs.is_reopen_cooldown_active(context.now.timestamp()):
-                return Decision(proceed=False)
+                # 保留冷却载体，避免过期重建绕过禁开；行情和观察维护继续。
+                return Decision()
             duration = (
                 self.BZ_OBSERVATION_TIMEOUT_SECONDS
                 if StrategyTag.BZ in obs.strategy
@@ -3231,7 +3232,7 @@ class AUTOBN(MarketStrategy):
                 symbol, bars, state, context
             )
         obs = state.observations.get(symbol)
-        if obs is None:
+        if obs is None or obs.is_reopen_cooldown_active(context.now.timestamp()):
             return Decision()
         delta = bars.price - bars.closes[-2]
         is_long = delta > 0
@@ -3515,18 +3516,16 @@ class AUTOBN(MarketStrategy):
         )
 
     def observation_after_close(self, intent, state, now):
+        obs = state.observations.get(intent.symbol)
+        if obs is None or obs.side != intent.position.open_side:
+            return obs
         if StrategyTag.BD in intent.position.strategy:
             return None
-        obs = state.observations.get(intent.symbol)
-        return (
-            obs.model_copy(
-                update={
-                    "earliest_open_timestamp": now.timestamp()
-                    + self.REOPEN_COOLDOWN_SECONDS
-                }
-            )
-            if obs
-            else None
+        return obs.model_copy(
+            update={
+                "earliest_open_timestamp": now.timestamp()
+                + self.REOPEN_COOLDOWN_SECONDS
+            }
         )
 
     def position_after_add(self, intent, result):
