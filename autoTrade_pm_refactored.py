@@ -4230,6 +4230,9 @@ class AUTOA(MarketStrategy):
         )
         return obs.model_copy(
             update={
+                "strategy": tuple(
+                    tag for tag in obs.strategy if tag != StrategyTag.N
+                ),
                 "earliest_open_timestamp": None,
                 "reopen_pending_date": now.strftime("%Y-%m-%d"),
             }
