@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 from dataclasses import replace
 import tempfile
@@ -55,13 +56,10 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
         self.strategy = trading.AUTOBN(self.data)
         self.context = trading.MarketContext(now=NOW)
 
-    async def call_after(self, bars, *, observation=None, prior_positions=None, positions=None):
+    async def call_maintain(self, bars, *, observation=None, positions=None):
         observations = {SYMBOL: observation} if observation is not None else {}
         state = trading.StateSnapshot(positions or {}, observations)
-        prior = trading.StateSnapshot(prior_positions or {}, observations)
-        return await self.strategy.after_instrument(
-            SYMBOL, bars, state, prior, self.context
-        )
+        return await self.strategy.maintain_observation(SYMBOL, bars, state, self.context)
 
     @patch.object(
         trading,
@@ -69,7 +67,7 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
         return_value={"chebyshev_upper_bound": 0.01},
     )
     async def test_initial_bd_is_created_with_one_oi_window(self, _probability):
-        result = await self.call_after(make_bars())
+        result = await self.call_maintain(make_bars())
 
         self.data.bd_oi_windows.assert_awaited_once_with(SYMBOL, NOW)
         self.assertEqual(len(result.observations), 1)
@@ -85,7 +83,7 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
             bz_reference_high=123.0,
             reopen_pending_date="2026-09-16",
         )
-        result = await self.call_after(
+        result = await self.call_maintain(
             make_bars(peak_index=10), observation=existing
         )
 
@@ -110,7 +108,7 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
             bz_reference_high=123.0,
             reopen_pending_date="2026-09-16",
         )
-        result = await self.call_after(make_bars(), observation=existing)
+        result = await self.call_maintain(make_bars(), observation=existing)
 
         rebuilt = result.observations[0][1]
         self.assertEqual(
@@ -120,7 +118,7 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(rebuilt.reopen_pending_date)
 
     async def test_new_volume_peak_deletes_existing_bd_without_oi_request(self):
-        result = await self.call_after(
+        result = await self.call_maintain(
             make_bars(close=100.0, peak_index=10, last_volume=100.0),
             observation=make_observation(),
         )
@@ -130,7 +128,7 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bz_after_bd_deletion_does_not_inherit_cooldown(self):
         existing = make_observation()
-        result = await self.call_after(
+        result = await self.call_maintain(
             make_bars(close=101.0, peak_index=10, last_volume=100.0),
             observation=existing,
         )
@@ -142,7 +140,7 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bz_wins_without_requesting_bd_oi_or_inheriting_cooldown(self):
         existing = make_observation()
-        result = await self.call_after(
+        result = await self.call_maintain(
             make_bars(close=101.0, peak_index=10, last_volume=20.0),
             observation=existing,
         )
@@ -157,7 +155,7 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
             side=trading.OrderSide.BUY,
             strategy=(trading.StrategyTag.BZ,),
         )
-        result = await self.call_after(
+        result = await self.call_maintain(
             make_bars(close=101.0, peak_index=10, last_volume=20.0),
             observation=existing,
         )
@@ -180,7 +178,7 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
             side=trading.OrderSide.BUY,
             strategy=(trading.StrategyTag.BZ,),
         )
-        result = await self.call_after(make_bars(), observation=existing)
+        result = await self.call_maintain(make_bars(), observation=existing)
 
         replacement = result.observations[0][1]
         self.assertEqual(replacement.strategy, (trading.StrategyTag.BD,))
@@ -188,7 +186,7 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
         self.data.bd_oi_windows.assert_awaited_once_with(SYMBOL, NOW)
 
     async def test_refresh_evaluates_bd_prefilter_once(self):
-        await self.call_after(
+        await self.call_maintain(
             make_bars(peak_index=10), observation=make_observation()
         )
 
@@ -203,8 +201,8 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
     )
     async def test_held_symbol_keeps_current_initial_bd_behavior(self, _probability):
         held = object()
-        result = await self.call_after(
-            make_bars(), prior_positions={SYMBOL: held}, positions={SYMBOL: held}
+        result = await self.call_maintain(
+            make_bars(), positions={SYMBOL: held}
         )
 
         self.assertEqual(
@@ -212,106 +210,19 @@ class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.data.bd_oi_windows.assert_awaited_once_with(SYMBOL, NOW)
 
-    @patch.object(
-        trading,
-        "sample_probability",
-        return_value={"chebyshev_upper_bound": 0.01},
-    )
-    async def test_same_cycle_long_close_then_bd_drops_bz_cooldown(
-        self, _probability
-    ):
-        bars = make_bars()
-        self.data.wait_ready = AsyncMock(return_value=True)
-        self.data.fetch_bars = AsyncMock(return_value=bars)
-        held = trading.Position(
-            take_profit=90.0,
-            stop_loss=50.0,
-            position_side=trading.PositionSide.LONG,
-            entry_price=80.0,
-            name=SYMBOL,
-            date=20260916,
-            strategy=(trading.StrategyTag.BZ,),
-            guard=trading.OIStop(open_interest=0),
+    async def test_held_bd_refreshes_and_new_peak_deletes_before_signal(self):
+        existing = make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None)
+        held = object()
+        refreshed = await self.call_maintain(
+            make_bars(peak_index=10), observation=existing, positions={SYMBOL: held}
         )
-        observation = make_observation(
-            side=trading.OrderSide.BUY,
-            strategy=(trading.StrategyTag.BZ,),
-            earliest_open_timestamp=None,
+        self.assertEqual(refreshed.observations[0][1].timestamp, NOW.timestamp())
+        self.assertEqual(refreshed.observations[0][1].price, 100.0)
+        removed = await self.call_maintain(
+            make_bars(close=99.0, peak_index=10, last_volume=100.0),
+            observation=existing, positions={SYMBOL: held},
         )
-
-        after_states = []
-        real_after = self.strategy.after_instrument
-
-        async def capture_after(symbol, current_bars, current_state, prior, context):
-            after_states.append(current_state)
-            return await real_after(symbol, current_bars, current_state, prior, context)
-
-        with tempfile.TemporaryDirectory() as directory:
-            state = trading.TradingState(
-                "AUTOBN", f"{directory}/autobn-state.json"
-            )
-            state.apply(
-                trading.StatePatch(
-                    positions=((SYMBOL, held),),
-                    observations=((SYMBOL, observation),),
-                )
-            )
-            executor = Mock()
-            executor.REQUIRES_ORDER_JOURNAL = False
-            executor.prepare = AsyncMock(
-                side_effect=lambda intent: trading.PreparedOrder(
-                    intent=intent,
-                    quantity=1.0,
-                    price=bars.price,
-                    entry_price=held.entry_price,
-                )
-            )
-            result = trading.ExecutionResult(
-                status=trading.ExecutionStatus.FILLED,
-                quantity=1.0,
-                price=bars.price,
-                entry_price=held.entry_price,
-                ratio=1.0,
-                original_quantity=1.0,
-                remaining_quantity=0,
-            )
-            executor.submit = AsyncMock(return_value=result)
-            executor.complete_result = AsyncMock(return_value=result)
-            notifications = Mock()
-            notifications.send = AsyncMock()
-            engine = trading.TradingEngine(
-                self.strategy,
-                executor,
-                state,
-                notifications,
-                Mock(),
-                Mock(timeout=1),
-                Mock(),
-            )
-
-            with patch.object(
-                self.strategy,
-                "after_instrument",
-                new=AsyncMock(side_effect=capture_after),
-            ):
-                outcome = await engine.process_instrument(SYMBOL, self.context)
-            snapshot = state.snapshot()
-
-        self.assertEqual(len(after_states), 1)
-        state_before_after = after_states[0]
-        self.assertNotIn(SYMBOL, state_before_after.positions)
-        cooling_bz = state_before_after.observations[SYMBOL]
-        self.assertEqual(cooling_bz.strategy, (trading.StrategyTag.BZ,))
-        self.assertEqual(
-            cooling_bz.earliest_open_timestamp,
-            NOW.timestamp() + self.strategy.REOPEN_COOLDOWN_SECONDS,
-        )
-        self.assertEqual(outcome, trading.ScanOutcome.PROCESSED)
-        self.assertNotIn(SYMBOL, snapshot.positions)
-        replacement = snapshot.observations[SYMBOL]
-        self.assertEqual(replacement.strategy, (trading.StrategyTag.BD,))
-        self.assertIsNone(replacement.earliest_open_timestamp)
-        self.data.bd_oi_windows.assert_awaited_once_with(SYMBOL, NOW)
+        self.assertEqual(removed.observations, ((SYMBOL, None),))
 
 
 class AUTOBNCooldownEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -514,37 +425,23 @@ class AUTOBNCooldownEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(SYMBOL, snapshot.observations)
         self.executor.prepare.assert_not_awaited()
 
-    async def test_long_close_preserves_preexisting_bd_without_cooldown(self):
+    async def test_long_close_opposite_bd_opens_same_scan_without_cooldown(self):
         self.seed(
             self.cooling_bz(earliest_open_timestamp=None),
             self.position(trading.PositionSide.LONG),
         )
         snapshot = await self.scan(make_bars())
-        bd = snapshot.observations[SYMBOL]
-        self.assertIn(SYMBOL, snapshot.positions)
-        self.assertEqual(bd.strategy, (trading.StrategyTag.BD,))
-        self.assertIsNone(bd.earliest_open_timestamp)
-        self.executor.prepare.assert_not_awaited()
+        self.assertEqual(snapshot.observations[SYMBOL].strategy, (trading.StrategyTag.BD,))
+        self.assertEqual(snapshot.positions[SYMBOL].position_side, trading.PositionSide.LONG)
 
-        self.data.oi_5m.return_value = [{"sumOpenInterest": 80.0}]
-        self.data.bd_oi_windows.return_value = (
-            OI_WINDOW[:-1] + (80.0,),
-            OI_WINDOW[:-1],
-        )
-        snapshot = await self.scan(
-            make_bars(close=99.0), NOW + datetime.timedelta(minutes=1)
-        )
-        self.assertNotIn(SYMBOL, snapshot.positions)
-        self.assertEqual(snapshot.observations[SYMBOL], bd)
+        self.data.bd_oi_windows.return_value = (OI_WINDOW[:-1] + (80.0,), OI_WINDOW[:-1])
+        with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(True, 1.0, 150.0))):
+            snapshot = await self.scan(make_bars(close=99.0), NOW + datetime.timedelta(minutes=5))
+        self.assertEqual(snapshot.positions[SYMBOL].position_side, trading.PositionSide.SHORT)
+        self.assertIsNone(snapshot.observations[SYMBOL].earliest_open_timestamp)
         self.assertEqual(
-            self.executor.prepare.call_args.args[0].position.close_reason, "OI止损"
-        )
-
-        snapshot = await self.scan(
-            make_bars(close=99.0), NOW + datetime.timedelta(minutes=5)
-        )
-        self.assertEqual(
-            snapshot.positions[SYMBOL].position_side, trading.PositionSide.SHORT
+            [call.args[0].intent.kind for call in self.executor.submit.await_args_list],
+            [trading.ActionKind.CLOSE, trading.ActionKind.OPEN],
         )
 
     async def test_short_close_preserves_preexisting_bz(self):
@@ -589,6 +486,241 @@ class AUTOBNCooldownEngineTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.scan(make_bars(close=111.0))
         self.assertNotIn(SYMBOL, snapshot.positions)
         self.assertNotIn(SYMBOL, snapshot.observations)
+
+
+class AUTOBNSameCycleEntryTests(unittest.IsolatedAsyncioTestCase):
+    setUp = AUTOBNCooldownEngineTests.setUp
+    scan = AUTOBNCooldownEngineTests.scan
+    seed = AUTOBNCooldownEngineTests.seed
+    position = AUTOBNCooldownEngineTests.position
+
+    async def test_new_bz_observation_opens_in_same_scan(self):
+        bars = make_bars(close=101.0, peak_index=10, last_volume=20.0)
+        with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(True, 1.0, 150.0))) as check:
+            snapshot = await self.scan(bars)
+        self.assertEqual(snapshot.positions[SYMBOL].position_side, trading.PositionSide.LONG)
+        check.assert_awaited_once()
+        self.data.bd_oi_windows.assert_not_awaited()
+
+    async def test_reversal_closes_before_open_and_confirms_once(self):
+        for held_side, observation, bars, target in (
+            (trading.PositionSide.SHORT, make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+             make_bars(close=101.0, peak_index=10, last_volume=20.0), trading.PositionSide.LONG),
+            (trading.PositionSide.LONG, make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+             make_bars(close=99.0, peak_index=10), trading.PositionSide.SHORT),
+        ):
+            with self.subTest(side=held_side):
+                self.executor.submit.reset_mock()
+                self.executor.prepare.reset_mock()
+                self.data.bd_oi_windows.reset_mock()
+                self.seed(observation, self.position(held_side))
+                with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(True, 1.0, 150.0))) as check, patch.object(
+                    self.strategy, "maintain_observation", wraps=self.strategy.maintain_observation
+                ) as maintain:
+                    snapshot = await self.scan(bars)
+                self.assertEqual(snapshot.positions[SYMBOL].position_side, target)
+                self.assertEqual([call.args[0].intent.kind for call in self.executor.submit.await_args_list],
+                                 [trading.ActionKind.CLOSE, trading.ActionKind.OPEN])
+                check.assert_awaited_once()
+                maintain.assert_awaited_once()
+
+    async def test_deleted_bd_cannot_reverse_and_same_side_skips_confirmation(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        with patch.object(self.strategy, "check_side", new_callable=AsyncMock) as check:
+            snapshot = await self.scan(make_bars(close=99.0, peak_index=10, last_volume=100.0))
+        self.assertNotIn(SYMBOL, snapshot.observations)
+        self.assertEqual(snapshot.positions[SYMBOL].position_side, trading.PositionSide.LONG)
+        check.assert_not_awaited()
+        self.executor.submit.assert_not_awaited()
+
+        self.executor.submit.reset_mock()
+        self.seed(make_observation(side=trading.OrderSide.BUY,
+                                   strategy=(trading.StrategyTag.BZ,),
+                                   timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        with patch.object(self.strategy, "check_side", new_callable=AsyncMock) as check:
+            await self.scan(make_bars(close=101.0, peak_index=10, last_volume=20.0))
+        check.assert_not_awaited()
+        self.executor.submit.assert_not_awaited()
+
+    async def test_normal_exit_does_not_reuse_preclose_observation_for_entry(self):
+        self.seed(make_observation(side=trading.OrderSide.BUY,
+                                   strategy=(trading.StrategyTag.BZ,),
+                                   timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        self.data.oi_5m.return_value = [{"sumOpenInterest": 80.0}]
+        with patch.object(self.strategy, "check_side", new_callable=AsyncMock) as check:
+            snapshot = await self.scan(make_bars(close=99.0, peak_index=10))
+        self.assertNotIn(SYMBOL, snapshot.positions)
+        self.assertEqual(len(self.executor.submit.await_args_list), 1)
+        check.assert_not_awaited()
+
+    async def test_opposite_observation_without_full_signal_does_not_close(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(False, None, None))):
+            snapshot = await self.scan(make_bars(close=99.0, peak_index=10))
+        self.assertIn(SYMBOL, snapshot.positions)
+        self.executor.submit.assert_not_awaited()
+
+    async def test_failed_partial_unknown_close_never_opens(self):
+        for result in (
+            trading.ExecutionResult(trading.ExecutionStatus.FAILED, 0, 0, 100, 1, 1),
+            trading.ExecutionResult(trading.ExecutionStatus.UNKNOWN, 0, 0, 100, 1, 1),
+            trading.ExecutionResult(trading.ExecutionStatus.FILLED, 0.5, 99, 100, 1, 1, remaining_quantity=0.5),
+        ):
+            with self.subTest(status=result.status):
+                self.executor.submit.reset_mock()
+                self.executor.submit.return_value = result
+                self.executor.submit.side_effect = None
+                self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                          self.position(trading.PositionSide.LONG))
+                with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(True, 1.0, 150.0))):
+                    await self.scan(make_bars(close=99.0, peak_index=10))
+                self.assertEqual(len(self.executor.submit.await_args_list), 1)
+                self.assertEqual(self.executor.submit.await_args.args[0].intent.kind, trading.ActionKind.CLOSE)
+
+    async def test_pending_after_close_blocks_open_even_if_close_reported_success(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        pending = Mock()
+        self.state.pending_order = Mock(side_effect=[None, None, pending])
+        self.data.fetch_bars.return_value = replace(
+            make_bars(close=99.0, peak_index=10),
+            highs=tuple([102.0] * 30), lows=tuple([98.0] * 30),
+        )
+        with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(True, 1.0, 150.0))):
+            outcome = await self.engine.process_instrument(SYMBOL, trading.MarketContext(now=NOW))
+        self.assertEqual(outcome, trading.ScanOutcome.PENDING)
+        self.assertEqual(len(self.executor.submit.await_args_list), 1)
+        self.assertEqual(self.executor.submit.await_args.args[0].intent.kind, trading.ActionKind.CLOSE)
+
+    async def test_open_rejected_after_full_close_remains_flat(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        original_prepare = self.executor.prepare.side_effect
+        async def prepare(intent):
+            return None if intent.kind == trading.ActionKind.OPEN else original_prepare(intent)
+        self.executor.prepare.side_effect = prepare
+        with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(True, 1.0, 150.0))):
+            snapshot = await self.scan(make_bars(close=99.0, peak_index=10))
+        self.assertNotIn(SYMBOL, snapshot.positions)
+        self.assertEqual(len(self.executor.submit.await_args_list), 1)
+
+    async def test_held_bd_maintenance_failure_still_checks_existing_exit(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        self.data.bd_oi_windows.side_effect = RuntimeError("BD OI unavailable")
+        self.data.oi_5m.return_value = [{"sumOpenInterest": 80.0}]
+        with patch.object(self.strategy, "check_side", new_callable=AsyncMock) as check:
+            snapshot = await self.scan(make_bars(close=100.0, peak_index=10))
+        self.assertNotIn(SYMBOL, snapshot.positions)
+        self.assertEqual(self.executor.submit.await_args.args[0].intent.kind, trading.ActionKind.CLOSE)
+        self.assertEqual(self.executor.submit.await_args.args[0].intent.position.close_reason, "OI止损")
+        check.assert_not_awaited()
+
+    async def test_held_reversal_confirmation_failure_still_manages_position(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        self.data.bd_oi_windows.return_value = (OI_WINDOW[:-1] + (80.0,), OI_WINDOW[:-1])
+        self.data.oi_5m.return_value = [{"sumOpenInterest": 80.0}]
+        with patch.object(self.strategy, "check_side", new=AsyncMock(side_effect=RuntimeError("entry OI unavailable"))) as check:
+            snapshot = await self.scan(make_bars(close=99.0, peak_index=10))
+        self.assertNotIn(SYMBOL, snapshot.positions)
+        self.assertEqual(self.executor.submit.await_args.args[0].intent.position.close_reason, "OI止损")
+        check.assert_awaited_once()
+        self.assertEqual(len(self.executor.submit.await_args_list), 1)
+
+    async def test_flat_observation_failure_never_opens(self):
+        self.data.bd_oi_windows.side_effect = RuntimeError("BD OI unavailable")
+        with patch.object(self.strategy, "check_side", new_callable=AsyncMock) as check:
+            self.data.fetch_bars.return_value = make_bars(close=100.0)
+            outcome = await self.engine.process_instrument(SYMBOL, trading.MarketContext(now=NOW))
+        self.assertEqual(outcome, trading.ScanOutcome.FAILED)
+        self.executor.prepare.assert_not_awaited()
+        check.assert_not_awaited()
+
+    async def test_no_position_close_stays_flat_without_reversal_open(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        self.executor.submit.side_effect = lambda order: trading.ExecutionResult(
+            trading.ExecutionStatus.NO_POSITION, 0, order.price, order.entry_price, 1, 1
+        )
+        with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(True, 1.0, 150.0))):
+            snapshot = await self.scan(make_bars(close=99.0, peak_index=10))
+        self.assertNotIn(SYMBOL, snapshot.positions)
+        self.assertEqual(len(self.executor.submit.await_args_list), 1)
+        self.assertEqual(self.executor.submit.await_args.args[0].intent.kind, trading.ActionKind.CLOSE)
+
+    async def test_close_completion_exception_never_opens(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        self.executor.complete_result.side_effect = RuntimeError("close query failed")
+        self.data.fetch_bars.return_value = replace(
+            make_bars(close=99.0, peak_index=10),
+            highs=tuple([102.0] * 30), lows=tuple([98.0] * 30),
+        )
+        with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(True, 1.0, 150.0))):
+            outcome = await self.engine.process_instrument(SYMBOL, trading.MarketContext(now=NOW))
+        self.assertEqual(outcome, trading.ScanOutcome.FAILED)
+        self.assertEqual(len(self.executor.submit.await_args_list), 1)
+
+    async def test_cancelled_observation_propagates_without_orders(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        self.data.fetch_bars.return_value = make_bars(close=100.0, peak_index=10)
+        with patch.object(self.strategy, "maintain_observation", new=AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.engine.process_instrument(SYMBOL, trading.MarketContext(now=NOW))
+        self.executor.prepare.assert_not_awaited()
+
+    async def test_cancelled_close_completion_never_opens(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        self.executor.complete_result.side_effect = asyncio.CancelledError
+        self.data.fetch_bars.return_value = replace(
+            make_bars(close=99.0, peak_index=10),
+            highs=tuple([102.0] * 30), lows=tuple([98.0] * 30),
+        )
+        with patch.object(self.strategy, "check_side", new=AsyncMock(return_value=(True, 1.0, 150.0))):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.engine.process_instrument(SYMBOL, trading.MarketContext(now=NOW))
+        self.assertEqual(len(self.executor.submit.await_args_list), 1)
+        self.assertEqual(self.executor.submit.await_args.args[0].intent.kind, trading.ActionKind.CLOSE)
+
+    async def test_cancelled_reversal_confirmation_propagates_without_orders(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        self.data.fetch_bars.return_value = make_bars(close=99.0, peak_index=10)
+        with patch.object(self.strategy, "check_side", new=AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.engine.process_instrument(SYMBOL, trading.MarketContext(now=NOW))
+        self.executor.submit.assert_not_awaited()
+
+    async def test_pending_skips_observation_and_signal(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        pending = Mock()
+        self.state.pending_order = Mock(return_value=pending)
+        self.executor.reconcile = AsyncMock(return_value=Mock(status=trading.ExecutionStatus.UNKNOWN))
+        with patch.object(self.strategy, "maintain_observation", new_callable=AsyncMock) as maintain, patch.object(
+            self.strategy, "check_side", new_callable=AsyncMock
+        ) as check:
+            outcome = await self.engine.process_instrument(SYMBOL, trading.MarketContext(now=NOW))
+        self.assertEqual(outcome, trading.ScanOutcome.PENDING)
+        maintain.assert_not_awaited()
+        check.assert_not_awaited()
+        self.executor.submit.assert_not_awaited()
+
+    async def test_recovery_is_not_treated_as_reversal(self):
+        self.seed(make_observation(timestamp=NOW.timestamp(), earliest_open_timestamp=None),
+                  self.position(trading.PositionSide.LONG))
+        self.data.recovery_symbols.return_value = (SYMBOL,)
+        with patch.object(self.strategy, "check_side", new_callable=AsyncMock) as check:
+            await self.scan(make_bars(close=99.0, peak_index=10))
+        check.assert_not_awaited()
+        self.executor.submit.assert_not_awaited()
 
 
 if __name__ == "__main__":

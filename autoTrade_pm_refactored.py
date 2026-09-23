@@ -2684,8 +2684,11 @@ class MarketStrategy(ABC):
         self, symbol, bars: MarketBars, state: StateSnapshot, context
     ) -> Decision: ...
 
-    async def after_instrument(self, symbol, bars, state, prior, context) -> StatePatch:
+    async def maintain_observation(self, symbol, bars, state, context) -> StatePatch:
         return StatePatch()
+
+    async def reversal_signal(self, symbol, bars, state, context) -> Decision:
+        return Decision()
 
     @abstractmethod
     async def refresh_universe(
@@ -2861,6 +2864,47 @@ class TradingEngine:
                 if not bars:
                     return ScanOutcome.NO_DATA
                 state = self.state.snapshot()
+                observation_ready = False
+                try:
+                    self.state.apply(
+                        await self.strategy.maintain_observation(
+                            symbol, bars, state, context
+                        )
+                    )
+                    observation_ready = True
+                except Exception:
+                    if symbol not in state.positions:
+                        raise
+                    self.logger.exception(f"{symbol}观察维护失败，继续原持仓管理")
+                state = self.state.snapshot()
+                reversal = Decision()
+                if observation_ready and symbol in state.positions:
+                    try:
+                        reversal = await self.strategy.reversal_signal(
+                            symbol, bars, state, context
+                        )
+                        self.state.apply(reversal.patch)
+                    except Exception:
+                        self.logger.exception(f"{symbol}反向信号确认失败，继续原持仓管理")
+                        reversal = Decision()
+                if reversal.intent is not None:
+                    held = state.positions[symbol]
+                    close = TradeIntent(
+                        ActionKind.CLOSE,
+                        symbol,
+                        held.model_copy(update={"close_reason": "反向信号"}),
+                        bars.price,
+                        reversal.intent.atr,
+                    )
+                    closed = await self.execute_action(close, context)
+                    # 成功返回并不足以说明全平，部分成交与待确认订单不能继续反手。
+                    if self.state.pending_order(symbol) is not None:
+                        return ScanOutcome.PENDING
+                    if closed and symbol not in self.state.snapshot().positions:
+                        await self.execute_action(reversal.intent, context)
+                        if self.state.pending_order(symbol) is not None:
+                            return ScanOutcome.PENDING
+                    return ScanOutcome.PROCESSED
                 decision = await (
                     self.strategy.manage_position(symbol, bars, state, context)
                     if symbol in state.positions
@@ -2871,14 +2915,6 @@ class TradingEngine:
                     if not await self.execute_action(decision.intent, context):
                         if self.state.pending_order(symbol) is not None:
                             return ScanOutcome.PENDING
-                        # 原开仓失败会终止本轮；已有持仓的失败加仓/平仓仍执行观察后处理。
-                        if decision.intent.kind == ActionKind.OPEN:
-                            return ScanOutcome.PROCESSED
-                self.state.apply(
-                    await self.strategy.after_instrument(
-                        symbol, bars, self.state.snapshot(), prior, context
-                    )
-                )
             return ScanOutcome.PROCESSED
         except InsufficientKlineHistory as error:
             self.logger.info(str(error))
@@ -3231,6 +3267,18 @@ class AUTOBN(MarketStrategy):
             return await self._recover_unregistered_position(
                 symbol, bars, state, context
             )
+        return await self._entry_signal(symbol, bars, state, context)
+
+    async def reversal_signal(self, symbol, bars, state, context):
+        if symbol in self.data.recovery_symbols():
+            return Decision()
+        obs = state.observations.get(symbol)
+        held = state.positions[symbol]
+        if obs is None or obs.side == held.open_side:
+            return Decision()
+        return await self._entry_signal(symbol, bars, state, context)
+
+    async def _entry_signal(self, symbol, bars, state, context):
         obs = state.observations.get(symbol)
         if obs is None or obs.is_reopen_cooldown_active(context.now.timestamp()):
             return Decision()
@@ -3451,14 +3499,9 @@ class AUTOBN(MarketStrategy):
             update={"earliest_open_timestamp": previous.earliest_open_timestamp}
         )
 
-    async def after_instrument(self, symbol, bars, state, prior, context):
+    async def maintain_observation(self, symbol, bars, state, context):
         obs = state.observations.get(symbol)
-        refresh_existing_bd = (
-            symbol not in prior.positions
-            and symbol not in state.positions
-            and obs is not None
-            and StrategyTag.BD in obs.strategy
-        )
+        refresh_existing_bd = obs is not None and StrategyTag.BD in obs.strategy
         delete_existing_bd = refresh_existing_bd and bars.volumes[-1] >= max(
             bars.volumes[:-1]
         )
