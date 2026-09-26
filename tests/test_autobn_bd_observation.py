@@ -47,6 +47,64 @@ def make_observation(**updates):
     return trading.Observation(**values)
 
 
+class AUTOBNOIThresholdTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.data = Mock()
+        self.data.recovery_symbols.return_value = ()
+        self.strategy = trading.AUTOBN(self.data)
+        self.sample = [99.0, 101.0] * 12
+        self.expected = trading.sample_probability(self.sample, 200.0)
+        self.expected = self.expected["mean"] + 10 * self.expected["std"]
+        self.data.oi_history = AsyncMock(return_value=[
+            {"timestamp": i, "sumOpenInterest": value}
+            for i, value in enumerate(self.sample + [150.0] * 6)
+        ])
+        self.data.oi_5m = AsyncMock(return_value=[{"sumOpenInterest": 200.0}])
+        self.data.lsr_1h = AsyncMock(return_value=[
+            {"timestamp": i, "longAccount": 0.5} for i in range(30)
+        ])
+        self.data.lsr_5m = AsyncMock(return_value=[
+            {"longShortRatio": 0.5, "longAccount": 0.3}
+        ])
+
+    async def test_long_entry_saves_chebyshev_threshold_below_90_percent(self):
+        self.data.basis_rate = AsyncMock(return_value=0.0)
+        bars = replace(make_bars(close=101.0), highs=(103.0,) * 30, lows=(97.0,) * 30)
+        observation = make_observation(
+            side=trading.OrderSide.BUY, strategy=(trading.StrategyTag.BZ,),
+            earliest_open_timestamp=None,
+        )
+        decision = await self.strategy.evaluate_signal(
+            SYMBOL, bars, trading.StateSnapshot({}, {SYMBOL: observation}),
+            trading.MarketContext(now=NOW),
+        )
+        self.assertIsNotNone(decision.intent)
+        self.assertAlmostEqual(decision.intent.position.guard.open_interest, self.expected)
+        self.assertLess(self.expected, 200.0 * 0.9)
+
+    async def test_recovery_ignores_current_and_historical_90_percent_floors(self):
+        for latest, recent in ((200.0, 150.0), (120.0, 300.0)):
+            with self.subTest(latest=latest, recent=recent):
+                self.data.oi_5m.return_value = [{"sumOpenInterest": latest}]
+                self.data.oi_history.return_value = [
+                    {"sumOpenInterest": value} for value in self.sample + [recent] * 6
+                ]
+                current, threshold = await self.strategy._recovery_oi_threshold(SYMBOL, NOW)
+                self.assertEqual(current, latest)
+                self.assertAlmostEqual(threshold, self.expected)
+
+    async def test_short_entry_keeps_90_percent_drawdown_without_guard(self):
+        for current, passed in ((90.0, True), (90.1, False)):
+            with self.subTest(current=current):
+                self.data.bd_oi_windows = AsyncMock(return_value=((current,), (100.0,)))
+                self.assertEqual(
+                    await self.strategy.check_side(SYMBOL, "SHORT", NOW),
+                    (passed, None, None),
+                )
+        self.data.oi_history.assert_not_awaited()
+        self.data.lsr_1h.assert_not_awaited()
+
+
 class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.data = Mock()

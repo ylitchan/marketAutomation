@@ -3151,7 +3151,6 @@ class AUTOBN(MarketStrategy):
     PARTIAL_CLOSE_RATIO = 0.7
     TRAILING_STOP_PROFIT_RATIO = 0.7
     BASIS_RATE_THRESHOLD = 0.02
-    BZ_LONG_OI_DRAWDOWN_RATIO = 0.1
     BD_OI_DRAWDOWN_RATIO = 0.1
     CHEBYSHEV_EXTREME_THRESHOLD = 0.01
     SHORT_OI_CHEB_THRESHOLD = 0.05
@@ -3751,18 +3750,17 @@ class AUTOBN(MarketStrategy):
                 if not passed:
                     return False, None, None
 
-                stop_guard_threshold = self._oi_stop_threshold(oi_5m_last, chebyshev)
+                stop_guard_threshold = self._oi_stop_threshold(chebyshev)
                 return True, lsrd, stop_guard_threshold
 
         except Exception:
             self.data.logger.exception("检查增仓信号时发生错误")
             return False, None, None
 
-    def _oi_stop_threshold(self, peak_oi, statistics):
-        threshold = max(
-            peak_oi * (1 - self.BZ_LONG_OI_DRAWDOWN_RATIO),
+    def _oi_stop_threshold(self, statistics):
+        threshold = (
             statistics["mean"]
-            + statistics["std"] / self.CHEBYSHEV_EXTREME_THRESHOLD**0.5,
+            + statistics["std"] / self.CHEBYSHEV_EXTREME_THRESHOLD**0.5
         )
         if not math.isfinite(threshold) or threshold <= 0:
             raise ValueError("计算出的OI止损阈值无效")
@@ -3779,7 +3777,7 @@ class AUTOBN(MarketStrategy):
             raise ValueError("恢复OI阈值的数据无效")
         sample = values[: -self.LONG_OI_CHEB_EXCLUDE_RECENT_COUNT]
         return latest, self._oi_stop_threshold(
-            max(latest, max(values)), sample_probability(sample, latest)
+            sample_probability(sample, latest)
         )
 
     async def _recover_unregistered_position(self, symbol, bars, state, context):
