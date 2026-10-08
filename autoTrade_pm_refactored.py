@@ -1782,8 +1782,8 @@ class BinanceMarketData(MarketData):
             raise ValueError(f"不支持的历史数据周期: {period}")
         return int(utc_boundary.timestamp() * 1000)
 
-    async def oi_history(self, symbol: str, dtn: datetime, period: str):
-        """按1d/1h周期隔离缓存历史OI，新的完整序列才替换对应缓存。"""
+    async def oi_history(self, symbol: str, dtn: datetime, period: str, *, require_current=False):
+        """按周期缓存完整OI；require_current 禁止返回落后当前边界的兜底缓存。"""
         available_before_ts = self._utc_history_boundary_ms(dtn, period)
         cache_key = (symbol, period)
         cached = self.cache.oi_history.get(cache_key)
@@ -1805,7 +1805,7 @@ class BinanceMarketData(MarketData):
             self.logger.error(
                 f"{symbol}获取{period}持仓量数据失败: {type(e).__name__}: {e!r}"
             )
-            return self.cache.oi_history.get(cache_key)
+            return None if require_current else self.cache.oi_history.get(cache_key)
 
         available_oi = [
             item
@@ -1825,7 +1825,14 @@ class BinanceMarketData(MarketData):
             if self.cache.oi_history.get(cache_key) is not cached
             else "unchanged",
         )
-        return self.cache.oi_history.get(cache_key)
+        result = self.cache.oi_history.get(cache_key)
+        if require_current and (
+            not result
+            or len(result) < self.OI_QUERY_LIMIT
+            or self._bar_timestamp_ms(result[-1]) != available_before_ts
+        ):
+            return None
+        return result
 
     async def bd_oi_windows(self, symbol, dtn: datetime):
         """返回BD入池实时窗口和开仓使用的已完成日线OI窗口。"""
@@ -3358,6 +3365,32 @@ class AUTOBN(MarketStrategy):
                 }
             )
             patch = StatePatch(positions=((symbol, held),))
+        if (
+            is_long
+            and held.tp_count > 0
+            and isinstance(held.guard, OIStop)
+            and math.isfinite(held.guard.open_interest)
+            and held.guard.open_interest > 0
+        ):
+            try:
+                history = await self.data.oi_history(
+                    symbol, context.now, "1h", require_current=True
+                )
+                if not history or len(history) < self.OI_QUERY_LIMIT:
+                    raise ValueError("止盈后OI保护所需小时数据不足")
+                values = [float(row["sumOpenInterest"]) for row in history]
+                if any(not math.isfinite(value) or value <= 0 for value in values):
+                    raise ValueError("止盈后OI保护的小时数据无效")
+                threshold = max(held.guard.open_interest, max(values) * 0.9)
+                if threshold > held.guard.open_interest:
+                    held = held.model_copy(
+                        update={"guard": OIStop(open_interest=threshold)}
+                    )
+                    patch = StatePatch(positions=((symbol, held),))
+            except Exception as error:
+                self.data.logger.warning(
+                    f"{symbol} 止盈后OI保护更新失败，保留原阈值继续退出检查:{error}"
+                )
         reason = None
         ratio = 1.0
         stage = None

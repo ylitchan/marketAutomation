@@ -105,6 +105,111 @@ class AUTOBNOIThresholdTests(unittest.IsolatedAsyncioTestCase):
         self.data.lsr_1h.assert_not_awaited()
 
 
+class AUTOBNPostProfitOITrackingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.data = Mock()
+        self.data.recovery_symbols.return_value = ()
+        self.data.oi_history = AsyncMock(return_value=[{"sumOpenInterest": 200.0}] * 30)
+        self.data.oi_5m = AsyncMock(return_value=[{"sumOpenInterest": 500.0}])
+        self.strategy = trading.AUTOBN(self.data)
+        self.held = trading.Position(
+            take_profit=200.0, stop_loss=50.0,
+            position_side=trading.PositionSide.LONG, entry_price=100.0,
+            name=SYMBOL, date=0, strategy=(trading.StrategyTag.BZ,),
+            tp_count=1, guard=trading.OIStop(open_interest=100.0),
+        )
+
+    async def check(self, held=None, price=100.0):
+        return await self.strategy.manage_position(
+            SYMBOL, replace(make_bars(close=price), highs=(101.0,) * 30, lows=(99.0,) * 30),
+            trading.StateSnapshot({SYMBOL: held or self.held}, {}),
+            trading.MarketContext(now=NOW),
+        )
+
+    async def test_each_check_raises_guard_without_another_take_profit(self):
+        held = self.held
+        for peak, expected in ((200.0, 180.0), (300.0, 270.0), (150.0, 270.0)):
+            self.data.oi_history.return_value = [{"sumOpenInterest": 1.0}] * 29 + [{"sumOpenInterest": peak}]
+            decision = await self.check(held)
+            self.assertIsNone(decision.intent)
+            held = dict(decision.patch.positions)[SYMBOL]
+            self.assertEqual(held.guard.open_interest, expected)
+            self.assertEqual(held.tp_count, 1)
+        self.assertEqual(self.data.oi_history.await_count, 3)
+
+    async def test_new_guard_triggers_oi_stop_in_same_check(self):
+        self.data.oi_5m.return_value = [{"sumOpenInterest": 180.0}]
+        decision = await self.check()
+        self.assertEqual(decision.intent.position.close_reason, "OI止损")
+        self.assertEqual(decision.intent.position.guard.open_interest, 180.0)
+        self.assertEqual(dict(decision.patch.positions)[SYMBOL].guard.open_interest, 180.0)
+
+    async def test_exit_and_add_intents_keep_updated_guard(self):
+        for price, kind, reason in ((40.0, trading.ActionKind.CLOSE, "止盈后价格止损"),
+                                     (210.0, trading.ActionKind.CLOSE, "止盈"),
+                                     (90.0, trading.ActionKind.ADD, "")):
+            with self.subTest(price=price):
+                decision = await self.check(price=price)
+                self.assertEqual(decision.intent.kind, kind)
+                self.assertEqual(decision.intent.position.close_reason, reason)
+                self.assertEqual(decision.intent.position.guard.open_interest, 180.0)
+                self.assertEqual(dict(decision.patch.positions)[SYMBOL].guard.open_interest, 180.0)
+
+    async def test_no_history_query_before_profit_or_for_short(self):
+        for updates in ({"tp_count": 0}, {"position_side": trading.PositionSide.SHORT}):
+            await self.check(self.held.model_copy(update=updates))
+        self.data.oi_history.assert_not_awaited()
+
+    async def test_bad_history_preserves_old_guard_and_exit(self):
+        for history in (None, [], [{"sumOpenInterest": 200.0}] * 29,
+                        [{"sumOpenInterest": value} for value in [200.0] * 29 + [float("nan")]],
+                        [{"sumOpenInterest": 0.0}] * 30):
+            with self.subTest(history=history):
+                self.data.oi_history.return_value = history
+                self.data.oi_5m.return_value = [{"sumOpenInterest": 100.0}]
+                decision = await self.check()
+                self.assertEqual(decision.intent.position.close_reason, "OI止损")
+                self.assertEqual(decision.intent.position.guard.open_interest, 100.0)
+        self.data.oi_history.side_effect = RuntimeError("offline")
+        for price, reason in ((40.0, "止盈后价格止损"), (210.0, "止盈"), (100.0, "OI止损")):
+            decision = await self.check(price=price)
+            self.assertEqual(decision.intent.position.close_reason, reason)
+            self.assertEqual(decision.intent.position.guard.open_interest, 100.0)
+
+    async def test_real_data_rejects_stale_fallback_but_accepts_current_window(self):
+        boundary = int(NOW.timestamp() * 1000)
+        for response in (RuntimeError("offline"), [], [{"timestamp": boundary, "sumOpenInterest": 200.0}], "fresh", "cached"):
+            with self.subTest(response=response):
+                gateway = Mock()
+                data = trading.BinanceMarketData(gateway, Mock())
+                current = [{"timestamp": boundary - (29 - i) * 3600000,
+                            "sumOpenInterest": 200.0} for i in range(30)]
+                stale = [dict(row, timestamp=row["timestamp"] - 3600000) for row in current]
+                data.cache.oi_history[(SYMBOL, "1h")] = current if response == "cached" else stale
+                gateway.call = AsyncMock()
+                if isinstance(response, Exception):
+                    gateway.call.side_effect = response
+                else:
+                    gateway.call.return_value = current if response == "fresh" else response
+                data.oi_5m = AsyncMock(return_value=[{"sumOpenInterest": 150.0}])
+                data.recovery_symbols = Mock(return_value=())
+                self.strategy = trading.AUTOBN(data)
+                decision = await self.check()
+                if response in ("fresh", "cached"):
+                    self.assertEqual(decision.intent.position.close_reason, "OI止损")
+                    self.assertEqual(decision.intent.position.guard.open_interest, 180.0)
+                else:
+                    self.assertIsNone(decision.intent)
+                    self.assertEqual(dict(decision.patch.positions)[SYMBOL].guard.open_interest, 100.0)
+                if response == "cached":
+                    gateway.call.assert_not_awaited()
+
+    async def test_history_cancellation_propagates(self):
+        self.data.oi_history.side_effect = asyncio.CancelledError
+        with self.assertRaises(asyncio.CancelledError):
+            await self.check()
+
+
 class AUTOBNBDObservationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.data = Mock()
