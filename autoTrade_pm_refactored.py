@@ -3477,9 +3477,9 @@ class AUTOBN(MarketStrategy):
                 )
                 return Decision(patch)
         if (
-            price < held.entry_price - atr
+            price < min(bars.midprice, held.entry_price) - atr
             if is_long
-            else price > held.entry_price + atr
+            else price > max(bars.midprice, held.entry_price) + atr
         ):
             return Decision(
                 patch, TradeIntent(ActionKind.ADD, symbol, held, price, atr)

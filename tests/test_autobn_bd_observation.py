@@ -105,6 +105,50 @@ class AUTOBNOIThresholdTests(unittest.IsolatedAsyncioTestCase):
         self.data.lsr_1h.assert_not_awaited()
 
 
+class AUTOBNAddBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_uses_lower_hl2_or_entry_and_strict_boundary(self):
+        await self.check_cases(trading.PositionSide.LONG,
+                               ((90.0, 90.0, False), (90.0, 85.0, False),
+                                (90.0, 84.0, True), (110.0, 95.0, False),
+                                (110.0, 94.0, True)))
+
+    async def test_short_uses_higher_hl2_or_entry_and_strict_boundary(self):
+        await self.check_cases(trading.PositionSide.SHORT,
+                               ((110.0, 110.0, False), (110.0, 115.0, False),
+                                (110.0, 116.0, True), (90.0, 105.0, False),
+                                (90.0, 106.0, True)))
+
+    async def check_cases(self, side, cases):
+        data = Mock()
+        data.recovery_symbols.return_value = ()
+        data.oi_5m = AsyncMock(return_value=[{"sumOpenInterest": 500.0}])
+        strategy = trading.AUTOBN(data)
+        held = trading.Position(
+            take_profit=200.0 if side == trading.PositionSide.LONG else 10.0,
+            stop_loss=10.0 if side == trading.PositionSide.LONG else 200.0,
+            position_side=side, entry_price=100.0, name=SYMBOL, date=0,
+            strategy=(trading.StrategyTag.BZ if side == trading.PositionSide.LONG
+                      else trading.StrategyTag.BD,),
+            guard=trading.OIStop(open_interest=100.0),
+        )
+        for midprice, price, should_add in cases:
+            with self.subTest(side=side, midprice=midprice, price=price):
+                bars = replace(make_bars(close=price),
+                               highs=(midprice + 30.0,) * 30,
+                               lows=(midprice - 30.0,) * 30)
+                self.assertEqual(bars.midprice, midprice)
+                with patch.object(strategy, "calculate_atr", return_value=5.0):
+                    decision = await strategy.manage_position(
+                        SYMBOL, bars, trading.StateSnapshot({SYMBOL: held}, {}),
+                        trading.MarketContext(now=NOW),
+                    )
+                if should_add:
+                    self.assertEqual(decision.intent.kind, trading.ActionKind.ADD)
+                    self.assertEqual(decision.intent.position, held)
+                else:
+                    self.assertIsNone(decision.intent)
+
+
 class AUTOBNPostProfitOITrackingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.data = Mock()
