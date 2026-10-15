@@ -3395,11 +3395,14 @@ class AUTOBN(MarketStrategy):
         ratio = 1.0
         stage = None
         if (
-            (held.tp_count > 0 and held.stop_loss > 0 and price <= held.stop_loss)
+            (held.stop_loss > 0 and price <= held.stop_loss)
             if is_long
             else price >= held.stop_loss
         ):
-            reason = "止盈后价格止损" if is_long else held.close_reason or "初始止损"
+            if is_long:
+                reason = "止盈后价格止损" if held.tp_count > 0 else "初始止损"
+            else:
+                reason = held.close_reason or "初始止损"
         else:
             tp = price >= held.take_profit if is_long else price <= held.take_profit
             first = False
@@ -3477,9 +3480,9 @@ class AUTOBN(MarketStrategy):
                 )
                 return Decision(patch)
         if (
-            price < min(bars.midprice, held.entry_price) - atr
+            price < held.entry_price - atr
             if is_long
-            else price > max(bars.midprice, held.entry_price) + atr
+            else price > held.entry_price + atr
         ):
             return Decision(
                 patch, TradeIntent(ActionKind.ADD, symbol, held, price, atr)

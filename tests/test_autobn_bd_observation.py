@@ -105,16 +105,52 @@ class AUTOBNOIThresholdTests(unittest.IsolatedAsyncioTestCase):
         self.data.lsr_1h.assert_not_awaited()
 
 
+class AUTOBNInitialPriceStopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_price_stop_before_and_after_take_profit(self):
+        for count, price, stop, reason in (
+            (0, 90.0, 90.0, "初始止损"),
+            (0, 89.0, 90.0, "初始止损"),
+            (0, 91.0, 90.0, None),
+            (1, 90.0, 90.0, "止盈后价格止损"),
+            (0, 90.0, 0.0, None),
+        ):
+            with self.subTest(count=count, price=price, stop=stop):
+                data = Mock()
+                data.recovery_symbols.return_value = ()
+                data.oi_5m = AsyncMock(return_value=[{"sumOpenInterest": 500.0}])
+                data.oi_history = AsyncMock(return_value=None)
+                strategy = trading.AUTOBN(data)
+                held = trading.Position(
+                    take_profit=200.0, stop_loss=stop,
+                    position_side=trading.PositionSide.LONG, entry_price=100.0,
+                    name=SYMBOL, date=0, strategy=(trading.StrategyTag.BZ,),
+                    tp_count=count, guard=trading.OIStop(open_interest=100.0),
+                )
+                with patch.object(strategy, "calculate_atr", return_value=0.0):
+                    decision = await strategy.manage_position(
+                        SYMBOL, make_bars(close=price),
+                        trading.StateSnapshot({SYMBOL: held}, {}),
+                        trading.MarketContext(now=NOW),
+                    )
+                if reason:
+                    self.assertEqual(decision.intent.kind, trading.ActionKind.CLOSE)
+                    self.assertEqual(decision.intent.position.close_reason, reason)
+                    self.assertEqual(decision.intent.ratio, 1.0)
+                    data.oi_5m.assert_not_awaited()
+                else:
+                    self.assertTrue(decision.intent is None or decision.intent.kind != trading.ActionKind.CLOSE)
+
+
 class AUTOBNAddBoundaryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_long_uses_lower_hl2_or_entry_and_strict_boundary(self):
+    async def test_long_uses_entry_regardless_of_hl2_and_strict_boundary(self):
         await self.check_cases(trading.PositionSide.LONG,
-                               ((90.0, 90.0, False), (90.0, 85.0, False),
+                               ((90.0, 90.0, True), (90.0, 85.0, True),
                                 (90.0, 84.0, True), (110.0, 95.0, False),
                                 (110.0, 94.0, True)))
 
-    async def test_short_uses_higher_hl2_or_entry_and_strict_boundary(self):
+    async def test_short_uses_entry_regardless_of_hl2_and_strict_boundary(self):
         await self.check_cases(trading.PositionSide.SHORT,
-                               ((110.0, 110.0, False), (110.0, 115.0, False),
+                               ((110.0, 110.0, True), (110.0, 115.0, True),
                                 (110.0, 116.0, True), (90.0, 105.0, False),
                                 (90.0, 106.0, True)))
 
